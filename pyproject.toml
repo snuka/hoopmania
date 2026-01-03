@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hoopmania"
+version = "0.1.0"
+description = "Basketball AI: Detect, Track, and Identify Basketball Players"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "HoopMania", email = "hoopmania@example.com"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "numpy>=1.24.0",
+    "opencv-python>=4.8.0",
+    "tqdm>=4.65.0",
+    "inference>=0.38.0",
+    "supervision>=0.25.0",
+    "transformers>=4.35.0",
+    "num2words>=0.5.12",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "python-dotenv>=1.0.0",
+    "cachetools>=5.0.0",
+    "Pillow>=9.0.0",
+    "gradio>=4.0.0",
+    "gdown>=4.7.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+hoopmania = "hoopmania.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hoopmania*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

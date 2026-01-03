@@ -1,0 +1,41 @@
+# Core
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+tqdm>=4.65.0
+
+# Roboflow/Inference
+# Use inference-gpu on Linux with NVIDIA GPU, inference on macOS
+inference>=0.38.0
+supervision>=0.25.0
+
+# Sports utilities (Roboflow) - install separately:
+# pip install git+https://github.com/roboflow/sports.git@feat/basketball
+
+# Transformers for SigLIP and SmolVLM2
+transformers>=4.35.0
+num2words>=0.5.12
+
+# CLI
+typer>=0.9.0
+rich>=13.0.0
+
+# Web UI
+gradio>=4.0.0
+
+# Download utilities
+gdown>=4.7.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Image processing
+Pillow>=9.0.0
+
+# ML utilities
+scipy>=1.10.0
+scikit-learn>=1.0.0
+
+# Compatibility
+cachetools>=5.0.0
