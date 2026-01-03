@@ -21,7 +21,7 @@ SAM2_DIR = PROJECT_ROOT / "segment-anything-2-real-time"
 
 # SAM2 Configuration
 SAM2_CHECKPOINT = SAM2_DIR / "checkpoints" / "sam2.1_hiera_large.pt"
-SAM2_CONFIG = "sam2/configs/sam2.1/sam2.1_hiera_l.yaml"
+SAM2_CONFIG = "sam2.1_hiera_l"
 
 # Model IDs (from Roboflow)
 PLAYER_DETECTION_MODEL_ID = "basketball-player-detection-3-ycjdo/4"
