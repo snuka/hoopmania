@@ -10,361 +10,529 @@
 
 ---
 
-## Architecture Comparison
+## Key Insight: Hybrid Detection + Manual ID
 
-### Before (Complex, Fragile)
+**Don't remove detection entirely - use it for SELECTION, not IDENTIFICATION.**
+
 ```
-Video → PlayerDetector → TeamClassifier → JerseyOCR → SAM2 → Stats
-         (unreliable)     (can flip)      (60% acc)   (good!)
+Current (All Automated - Fragile):
+Video → Detect → Classify Team → OCR Number → Track → Stats
+        ↑ fails   ↑ can flip     ↑ 60% acc
+
+Pivot (Hybrid - Robust):
+Video → Detect Boxes → User Clicks Box → User Enters Name/# → Track → Stats
+        ↑ works well   ↑ 100% accurate   ↑ 100% accurate
 ```
 
-### After (Simple, Reliable)
-```
-Video → User Click + Input → SAM2 → CourtMapper → StatsEngine → Export
-        (100% accurate)      (good!)  (reuse)      (new)        (new)
-```
-
-**Removed**: PlayerDetector (for ID), JerseyOCR, TeamClassifier
-**Kept**: SAM2Tracker, CourtMapper, CourtKeypointDetector
-**New**: StatsEngine, SubstitutionDetector, PDFExporter, HighlightClipper (future)
+**Why this is better than raw clicks:**
+- Detection gives precise bounding boxes (better tracking initialization)
+- Easier to click a highlighted box than find the exact player boundary
+- Shows "12 players detected - select up to 5" (clear affordance)
+- Still no OCR, no team classification - user provides identity
 
 ---
 
-## User Flow
+## Architecture
+
+### Components
+
+| Component | Status | Purpose |
+|-----------|--------|---------|
+| PlayerDetector | **KEEP** | Detect boxes for selection UI (not for ID) |
+| JerseyOCR | **REMOVE** | User provides jersey numbers |
+| TeamClassifier | **REMOVE** | User assigns teams |
+| SAM2Tracker | **KEEP** | Core tracking engine |
+| CourtKeypointDetector | **KEEP** | Court position mapping |
+| CourtMapper | **KEEP** | Transform to court coordinates |
+| StatsEngine | **NEW** | Calculate player statistics |
+| SubstitutionDetector | **NEW** | Detect when players leave court |
+| PDFExporter | **NEW** | Generate stats reports |
+
+### Data Model
+
+```python
+@dataclass
+class Player:
+    """A player in the roster (persists across substitutions)."""
+    id: str                      # UUID
+    name: str                    # "Marcus"
+    number: str                  # "23"
+    team: str                    # "My Team" or "Celtics"
+    color: Tuple[int, int, int]  # RGB for visualization
+
+@dataclass
+class Roster:
+    """All players who might appear in the game."""
+    my_team: List[Player]        # Up to 12-15 players
+    opponent_team: List[Player]  # Optional, for matchup analysis
+
+@dataclass
+class TrackingAnchor:
+    """A point where user identified a player on court."""
+    player_id: str
+    frame_idx: int
+    bbox: Tuple[float, float, float, float]
+
+@dataclass
+class Segment:
+    """A continuous tracking segment (between substitutions)."""
+    start_frame: int
+    end_frame: int
+    active_players: List[str]    # Player IDs currently on court
+    anchors: List[TrackingAnchor]
+
+@dataclass
+class GameSession:
+    """Complete game analysis."""
+    video_path: Path
+    roster: Roster
+    segments: List[Segment]
+    fps: float
+    court_mapping_available: bool
+```
+
+---
+
+## User Flow (Revised)
+
+### Flow 1: Quick Mode (Single Segment)
+For short clips or when user doesn't care about substitutions.
 
 ```
 1. Upload Video
-2. Select Reference Frame (auto or manual scrub)
-3. Click on Players to Track (max 5)
-   └── For each click:
-       ├── Enter Name (e.g., "Marcus")
-       ├── Enter Number (e.g., "23")
-       └── Select Team (dropdown or "My Team" / "Opponent")
-4. Click "Start Tracking"
-5. [System processes video with SAM2]
-6. [System detects substitutions, prompts re-tag if needed]
-7. View Results:
-   ├── Annotated Video (only selected players labeled)
-   ├── Stats Dashboard (per player)
-   └── Export Options (video file, PDF report)
+2. Auto-detect or scrub to reference frame
+3. System shows detected player boxes (numbered)
+4. User clicks boxes for players to track (max 5)
+   └── For each: Enter Name, Number, Team
+5. Click "Track Players"
+6. View results: Video + Stats + Export
 ```
 
----
+### Flow 2: Game Mode (Multiple Segments with Roster)
+For full games with substitutions.
 
-## Phase 1: Core Manual Selection + Tracking
-
-### 1.1 Simplified Data Model
-
-```python
-@dataclass
-class TrackedPlayer:
-    """A player selected by the user for tracking."""
-    name: str                    # "Marcus"
-    number: str                  # "23"
-    team: str                    # "My Team" or team name
-    color: Tuple[int, int, int]  # RGB for visualization
-    initial_bbox: Tuple[float, float, float, float]  # From user click
-    tracker_id: int              # Assigned by SAM2
-
-@dataclass
-class TrackingSession:
-    """A tracking session (one per video or per substitution segment)."""
-    video_path: Path
-    start_frame: int
-    end_frame: int  # -1 means end of video
-    players: List[TrackedPlayer]
-
-@dataclass
-class AnalysisConfig:
-    """Simplified config for manual tracking."""
-    output_dir: Path
-    generate_video: bool = True
-    generate_stats: bool = True
-    generate_pdf: bool = True
+```
+1. Upload Video
+2. Define Roster (optional, can add during tracking)
+   ├── My Team: Marcus #23, Jordan #11, Tyler #5, ...
+   └── Opponent: (optional)
+3. Select reference frame for first segment
+4. Click on 5 players currently on court
+   └── Assign from roster dropdown (or create new)
+5. Click "Start Tracking"
+6. When substitution detected:
+   ├── System pauses: "Marcus #23 left at 4:32"
+   ├── User confirms substitution
+   ├── User clicks replacement player
+   └── User assigns from roster: "Tyler #5 entering"
+7. Tracking continues
+8. View results: Per-player stats aggregated across segments
 ```
 
-### 1.2 UI Components (app.py)
+### Substitution UX Detail
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  HoopMania - Track Your Players                                │
-├─────────────────────────────────────────────────────────────────┤
+│  ⚠️ SUBSTITUTION DETECTED                                      │
 │                                                                 │
-│  [Upload Video]                                                 │
+│  Marcus Johnson (#23) appears to have left the court at 4:32   │
 │                                                                 │
+│  What happened?                                                 │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │                                                         │   │
-│  │            Reference Frame Preview                      │   │
-│  │       (click on players to select them)                 │   │
-│  │                                                         │   │
-│  │    [Auto-Select Best Frame]  [◄] ━━━●━━━━━ [►]         │   │
-│  │                                                         │   │
+│  │ ○ Substitution - select replacement player              │   │
+│  │ ○ Tracking lost - re-anchor Marcus at current frame     │   │
+│  │ ○ End of quarter - pause tracking here                  │   │
+│  │ ○ Ignore - Marcus will return shortly                   │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                                                                 │
-│  Selected Players:                                              │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ #1  [Marcus    ] [23  ] [My Team ▼] [🎨] [✕ Remove]     │  │
-│  │ #2  [Jordan    ] [11  ] [My Team ▼] [🎨] [✕ Remove]     │  │
-│  │ #3  [Click on a player to add...]                        │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  [Start Tracking]                                               │
-│                                                                 │
-├─────────────────────────────────────────────────────────────────┤
-│  Progress: 45.2% | ETA: 03:15 | GPU: 92%                       │
-├─────────────────────────────────────────────────────────────────┤
-│  Results:                                                       │
-│  [Video] [Stats] [Export PDF]                                   │
+│  [Show Frame at 4:32]  [Continue Without Action]               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.3 Core Pipeline (pipeline.py)
-
-```python
-class ManualTrackingPipeline:
-    """Simplified pipeline for manual player tracking."""
-
-    def __init__(self, config: AnalysisConfig):
-        self.config = config
-        self._tracker = SAM2Tracker()
-        self._court_mapper = CourtMapper()
-        self._keypoint_detector = CourtKeypointDetector()
-
-    def track(
-        self,
-        video_path: Path,
-        players: List[TrackedPlayer],
-        reference_frame: int = 0,
-        progress_callback = None,
-    ) -> TrackingResult:
-        """Track selected players through video."""
-        # 1. Initialize SAM2 with user-selected player boxes
-        # 2. Run tracking (forward + backward from reference)
-        # 3. Map court positions
-        # 4. Detect substitutions (player disappears)
-        # 5. Return tracking data
-```
+This distinguishes between:
+- **Substitution**: Player went to bench, new player enters
+- **Tracking Lost**: SAM2 lost the mask, need to re-anchor same player
+- **End of Quarter**: Natural break, will resume later
+- **Temporary Occlusion**: Player will reappear, just wait
 
 ---
 
-## Phase 2: Stats Generation
+## Stats Engine (Expanded)
 
-### 2.1 Stats to Calculate
+### Core Stats (From Position Data)
+
+| Stat | Description | Units | Requires Court Mapping? |
+|------|-------------|-------|------------------------|
+| Play Time | Time visible on court | minutes | No |
+| Distance | Total ground covered | feet/miles | Yes (relative without) |
+| Avg Speed | Mean movement speed | mph | Yes (relative without) |
+| Max Speed | Peak sprint speed | mph | Yes (relative without) |
+| Paint Time | Time in the paint | minutes | Yes |
+| Perimeter Time | Time outside paint | minutes | Yes |
+| 3PT Zone Time | Time beyond arc | minutes | Yes |
+| Corner Time | Time in corners | minutes | Yes |
+
+### Hustle Stats (From Movement Patterns)
 
 | Stat | Description | Calculation |
 |------|-------------|-------------|
-| **Play Time** | Time player is on court | Frames visible / FPS |
-| **Distance** | Total distance traveled | Sum of court position deltas |
-| **Avg Speed** | Average movement speed | Distance / Play Time |
-| **Max Speed** | Peak speed achieved | Max of frame-to-frame speeds |
-| **Paint Time** | Time in the paint | Frames where court_y > threshold |
-| **Perimeter Time** | Time on perimeter | Frames outside paint |
-| **Heatmap** | Position density | 2D histogram of court positions |
+| Sprint Count | Times player accelerated hard | Frames where accel > threshold |
+| Direction Changes | Quick cuts/pivots | Frames where heading changes >90° |
+| Stationary Time | Time standing still | Frames where speed < 0.5 mph |
+| Active Time % | Moving vs standing | (Play Time - Stationary) / Play Time |
 
-### 2.2 StatsEngine Class
+### Heatmap Zones
 
-```python
-@dataclass
-class PlayerStats:
-    player: TrackedPlayer
-    play_time_seconds: float
-    distance_feet: float
-    avg_speed_mph: float
-    max_speed_mph: float
-    paint_time_seconds: float
-    perimeter_time_seconds: float
-    heatmap: np.ndarray  # 2D density array
-    positions: List[Tuple[float, float]]  # All court positions
-
-class StatsEngine:
-    """Calculate player statistics from tracking data."""
-
-    COURT_LENGTH_FEET = 94
-    COURT_WIDTH_FEET = 50
-    PAINT_Y_THRESHOLD = 0.19  # ~19 feet from baseline
-
-    def calculate(
-        self,
-        player: TrackedPlayer,
-        court_positions: List[np.ndarray],
-        fps: float,
-    ) -> PlayerStats:
-        """Calculate all stats for a player."""
 ```
+┌─────────────────────────────────────────────┐
+│                                             │
+│  ┌───────┐             ┌───────┐           │
+│  │Corner │             │Corner │           │
+│  │ Left  │             │ Right │           │
+│  └───────┘             └───────┘           │
+│         ╲             ╱                     │
+│          ╲ 3PT ARC  ╱                      │
+│           ╲       ╱                         │
+│  ┌─────────────────────────────┐           │
+│  │         MID-RANGE           │           │
+│  └─────────────────────────────┘           │
+│        ┌─────────────────┐                 │
+│        │      PAINT      │                 │
+│        │    (THE KEY)    │                 │
+│        └─────────────────┘                 │
+│              [BASKET]                       │
+└─────────────────────────────────────────────┘
+```
+
+Time breakdown per zone gives coaching insights:
+- "Marcus spends 60% of time in paint" → Post player
+- "Jordan mostly in corners" → 3PT specialist
+- "Tyler high perimeter time" → Ball handler
+
+### Fallback: Relative Stats (No Court Mapping)
+
+If court keypoint detection fails:
+- Distance in pixels (still useful for comparison)
+- Speed in pixels/second
+- Heatmap in frame coordinates
+- Zone stats unavailable
+- Clear disclaimer: "Court mapping unavailable - stats are relative"
 
 ---
 
-## Phase 3: Substitution Detection
+## Handling Edge Cases
 
-### 3.1 Detection Logic
+### 1. Player Not in Reference Frame
+**Problem**: User wants to track a player who isn't visible in the auto-selected frame.
 
-A substitution is likely when:
-1. Tracked player's bounding box disappears for >10 seconds
-2. Player position is near sideline/bench area before disappearing
-3. Tracking confidence drops significantly
-
-### 3.2 User Notification Flow
-
+**Solution**: Allow adding players at ANY frame, not just one reference.
 ```
-[System detects Player #23 disappeared at 4:32]
+[Add Player at Different Frame]
      ↓
-[Notification]: "Marcus (#23) may have been substituted at 4:32.
-                 Would you like to tag a replacement?"
+[Scrub to frame where player is visible]
      ↓
-[User clicks new player entering the game]
+[Click + identify player]
      ↓
-[System]: "Who is replacing Marcus?"
-     ↓
-[User enters]: "Tyler, #5"
-     ↓
-[System continues tracking Tyler #5 for rest of video]
+[System tracks bidirectionally from that anchor point]
 ```
 
-### 3.3 Implementation
+### 2. Camera Cuts / Replays
+**Problem**: Broadcast footage has cuts to crowd, replays, etc.
 
-```python
-class SubstitutionDetector:
-    """Detect when tracked players leave the court."""
+**Solution**: Detect sudden frame changes and handle gracefully.
+- Large pixel difference between frames → likely camera cut
+- Option: "Mark this section as replay/break - skip tracking"
+- SAM2 naturally handles brief occlusions; longer breaks need user input
 
-    def __init__(self, disappear_threshold_seconds: float = 10.0):
-        self.threshold = disappear_threshold_seconds
-        self._last_seen: Dict[int, int] = {}  # tracker_id -> last frame
+### 3. Player Returns After Substitution
+**Problem**: Player gets subbed out, then subbed back in later.
 
-    def update(self, frame_idx: int, detections: sv.Detections) -> List[int]:
-        """Update with current frame, return list of substituted tracker_ids."""
+**Solution**: Roster concept handles this.
+- Player identity persists in roster
+- When they return: "Marcus #23 returning at 12:45 - click to track"
+- Stats aggregate across all their segments
 
-    def get_substitution_events(self) -> List[SubstitutionEvent]:
-        """Get all detected substitution events with timestamps."""
-```
+### 4. Tracking Confidence Drop
+**Problem**: SAM2 mask becomes unreliable but player is still on court.
+
+**Solution**: Expose tracking confidence to user.
+- Show confidence indicator per player
+- When confidence drops: "Tracking for Marcus is uncertain - verify or re-anchor"
+- Allow mid-video re-anchoring without creating new segment
 
 ---
 
-## Phase 4: Export
+## Visualization Options
 
-### 4.1 Video Export
-- Annotated video with only selected players labeled
-- Player name + number displayed above each player
-- Team color for bounding box/mask
-- Court minimap in corner (optional)
+### Option A: Focused View (Default)
+Only selected players are highlighted. Others are dimmed or invisible.
+- Clean, focuses attention
+- Good for parents tracking one kid
 
-### 4.2 PDF Report
+### Option B: Context View
+Selected players have full labels. Other detected players have generic boxes.
+- Shows game context
+- Good for coaches analyzing positioning
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    PLAYER STATS REPORT                          │
-│                    Game: vs Opponents                           │
-│                    Date: 2024-01-03                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  MARCUS JOHNSON (#23) - My Team                                │
-│  ───────────────────────────────────────────────────────────── │
-│                                                                 │
-│  Play Time:     18:34          Distance:    1.2 miles          │
-│  Avg Speed:     4.2 mph        Max Speed:   14.8 mph           │
-│  Paint Time:    4:12           Perimeter:   14:22              │
-│                                                                 │
-│  ┌─────────────────────────────┐                               │
-│  │                             │                               │
-│  │     [COURT HEATMAP]        │                               │
-│  │                             │                               │
-│  └─────────────────────────────┘                               │
-│                                                                 │
-├─────────────────────────────────────────────────────────────────┤
-│  JORDAN SMITH (#11) - My Team                                  │
-│  ...                                                           │
-└─────────────────────────────────────────────────────────────────┘
-```
+### Option C: Minimap Mode
+Full video unchanged, but corner shows court diagram with player dots.
+- Non-intrusive
+- Good for tactical analysis
+
+User can toggle between these.
 
 ---
 
-## Phase 5: Future Enhancements
+## Implementation Phases (Revised)
 
-### 5.1 Ball Tracking
+### Phase 1: Core Selection + Tracking (MVP)
+
+**1A: Detection-Assisted Selection UI**
+- Upload video
+- Auto-select or manual scrub to reference frame
+- Run player detection → show numbered boxes
+- Click boxes to select players
+- Enter name/number for each
+- Simple team assignment (My Team / Opponent)
+
+**1B: SAM2 Tracking Integration**
+- Initialize SAM2 with selected player bboxes
+- Bidirectional tracking from reference frame
+- Basic progress display
+
+**1C: Basic Output**
+- Annotated video with player labels
+- Simple stats display: play time, distance (relative)
+
+### Phase 2: Stats Engine
+
+**2A: Court Position Extraction**
+- Integrate court keypoint detection
+- Map player positions to court coordinates
+- Handle mapping failures gracefully
+
+**2B: Full Stats Calculation**
+- All core stats (distance, speed, zones)
+- Hustle metrics
+- Per-player heatmaps
+
+**2C: Stats UI**
+- Dashboard view with per-player cards
+- Heatmap visualization
+- Comparison view (if multiple players)
+
+### Phase 3: Substitution Handling
+
+**3A: Detection Logic**
+- Track when player mask disappears
+- Distinguish: substitution vs tracking lost vs occlusion
+- Detect segment boundaries (quarter breaks)
+
+**3B: Roster System**
+- Pre-define player roster
+- Assign players from roster during tracking
+- Persist identity across substitutions
+
+**3C: Re-tagging UI**
+- Pause and notify on substitution
+- Show options: sub / re-anchor / break / ignore
+- Smooth continuation of tracking
+
+### Phase 4: Export
+
+**4A: PDF Report**
+- Per-player stats summary
+- Heatmaps embedded
+- Professional formatting
+
+**4B: Video Export Options**
+- Full annotated video
+- Highlight clips (mark key moments manually for now)
+- Per-player "follow cam" clip
+
+### Phase 5: Polish & Future
+
+**5A: Multi-video support**
+- Aggregate stats across multiple video files
+- Handle full games recorded in parts
+
+**5B: Ball tracking (future)**
 - User clicks ball in addition to players
-- Enables: possession time, shot detection, assist tracking
-
-### 5.2 Highlight Clip Generation
-- When ball + player proximity detected, mark as "involvement"
-- Auto-generate clips of player's key moments
-- Export as separate video or timestamps
-
-### 5.3 Multi-Segment Tracking
-- Handle full games with multiple quarters
-- Automatic break detection (no movement for >30 seconds)
-- Per-quarter stats breakdown
+- Enables possession, shot detection
 
 ---
 
-## File Structure (Pivot Branch)
+## Files to Reuse from Previous Branch
+
+These were built in `feature/progress-tracking-gpu` and can be cherry-picked:
+
+| File | Purpose | Reuse? |
+|------|---------|--------|
+| `utils/progress.py` | Progress tracking with GPU/ETA | ✅ Yes |
+| `utils/frame_selector.py` | Reference frame selection + detection assist | ✅ Yes (core of new UI) |
+| `pipeline.py` (parts) | Bidirectional tracking logic | ✅ Partial |
+| `models/detector.py` | Player detection | ✅ Yes (for selection UI) |
+| `models/sam2_tracker.py` | SAM2 tracking | ✅ Yes |
+
+---
+
+## File Structure (Final)
 
 ```
 hoopmania/
-├── app.py                      # Simplified Gradio UI
+├── app.py                          # Gradio UI (simplified, focused)
+├── PIVOT_PLAN.md                   # This document
 ├── hoopmania/
-│   ├── config.py               # Simplified config
-│   ├── pipeline.py             # ManualTrackingPipeline (simplified)
+│   ├── config.py                   # Simplified config
+│   ├── pipeline.py                 # ManualTrackingPipeline
+│   │
 │   ├── models/
-│   │   ├── sam2_tracker.py     # Keep as-is
-│   │   └── court_keypoints.py  # Keep as-is
+│   │   ├── __init__.py
+│   │   ├── detector.py             # KEEP - for selection UI
+│   │   ├── sam2_tracker.py         # KEEP - core tracking
+│   │   └── court_keypoints.py      # KEEP - for stats
+│   │
+│   ├── tracking/
+│   │   ├── __init__.py
+│   │   ├── session.py              # NEW - GameSession, Segment, Roster
+│   │   └── substitution.py         # NEW - SubstitutionDetector
+│   │
+│   ├── stats/
+│   │   ├── __init__.py
+│   │   ├── engine.py               # NEW - StatsEngine
+│   │   ├── metrics.py              # NEW - Individual metric functions
+│   │   ├── zones.py                # NEW - Court zone definitions
+│   │   └── heatmap.py              # NEW - Heatmap generation
+│   │
 │   ├── processing/
-│   │   ├── court_mapper.py     # Keep as-is
-│   │   ├── stats_engine.py     # NEW: Calculate player stats
-│   │   └── substitution.py     # NEW: Detect substitutions
+│   │   ├── court_mapper.py         # KEEP
+│   │   └── video.py                # KEEP
+│   │
 │   ├── visualization/
-│   │   ├── annotator.py        # Simplified for manual labels
-│   │   ├── court_renderer.py   # Keep as-is
-│   │   └── heatmap.py          # NEW: Generate heatmaps
+│   │   ├── annotator.py            # SIMPLIFY - just labels
+│   │   ├── court_renderer.py       # KEEP + enhance for heatmaps
+│   │   └── dashboard.py            # NEW - stats dashboard components
+│   │
 │   ├── export/
-│   │   ├── video.py            # Video export with annotations
-│   │   └── pdf_report.py       # NEW: PDF stats report
+│   │   ├── __init__.py
+│   │   ├── video.py                # Video export
+│   │   └── pdf.py                  # PDF report generation
+│   │
 │   └── utils/
-│       ├── progress.py         # Reuse from previous branch
-│       └── frame_selector.py   # Reuse from previous branch
+│       ├── progress.py             # REUSE from previous branch
+│       └── frame_selector.py       # REUSE from previous branch
 ```
 
 ---
 
-## Implementation Order
+## UI Wireframe (Revised)
 
-1. **Phase 1A**: UI for player selection (click + name/number input)
-2. **Phase 1B**: Connect to SAM2 tracking with manual prompts
-3. **Phase 1C**: Basic annotated video output
-4. **Phase 2A**: Court position extraction (reuse existing)
-5. **Phase 2B**: StatsEngine implementation
-6. **Phase 2C**: Stats display in UI
-7. **Phase 3A**: Substitution detection
-8. **Phase 3B**: Re-tagging UI flow
-9. **Phase 4A**: PDF report generation
-10. **Phase 4B**: Export UI (download buttons)
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  HOOPMANIA - Track Your Players                                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  STEP 1: Upload Video                                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  [Choose File]  sample_game.mp4                                 │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  STEP 2: Select Reference Frame                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                                                                 │   │
+│  │              [VIDEO FRAME WITH DETECTED PLAYER BOXES]          │   │
+│  │                                                                 │   │
+│  │     ┌──[1]──┐   ┌──[2]──┐   ┌──[3]──┐                         │   │
+│  │     │      │   │      │   │      │   ... (detected players)  │   │
+│  │     └───────┘   └───────┘   └───────┘                         │   │
+│  │                                                                 │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│  [Auto-Select Best Frame]    ◄━━━━━━━━━━●━━━━━━━━━━►    Frame: 45/1501 │
+│                                                                         │
+│  STEP 3: Select Players to Track (click boxes above)                   │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  ✓ Player 1: [Marcus_____] #[23] [My Team     ▼] 🟢 [Remove]  │   │
+│  │  ✓ Player 2: [Jordan_____] #[11] [My Team     ▼] 🔵 [Remove]  │   │
+│  │  ○ Player 3: Click a box above to add...                       │   │
+│  │  ○ Player 4:                                                    │   │
+│  │  ○ Player 5:                                                    │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  [▶ Start Tracking]                                                     │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Progress: 67.3% | ETA: 02:15 | GPU: 94% | Tracking 2 players          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  RESULTS  [Video] [Stats] [Export PDF]                                  │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                                                                 │   │
+│  │  ┌─────────────┐  ┌─────────────┐                              │   │
+│  │  │ MARCUS #23  │  │ JORDAN #11  │                              │   │
+│  │  │ Play: 8:34  │  │ Play: 8:34  │                              │   │
+│  │  │ Dist: 0.6mi │  │ Dist: 0.8mi │                              │   │
+│  │  │ Spd: 4.2mph │  │ Spd: 5.1mph │                              │   │
+│  │  │ [Heatmap]   │  │ [Heatmap]   │                              │   │
+│  │  └─────────────┘  └─────────────┘                              │   │
+│  │                                                                 │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  [Download Video]  [Download PDF Report]                                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## Success Metrics
+## What Makes This Plan Better
+
+| Aspect | Original Plan | Improved Plan |
+|--------|---------------|---------------|
+| Player selection | Raw clicks (imprecise) | Detection-assisted boxes (precise) |
+| Substitution handling | Reactive only | Proactive options (sub/lost/break/ignore) |
+| Player identity | Per-segment only | Roster persists across segments |
+| Court mapping failure | Not addressed | Graceful fallback with relative stats |
+| Stats depth | Basic 6 stats | 12+ stats including hustle metrics |
+| Multi-anchor | One reference frame | Add players at any frame |
+| Code reuse | Start fresh | Cherry-pick from previous branch |
+| Tracking issues | Generic "disappeared" | Distinguish lost vs substituted |
+
+---
+
+## Success Criteria
 
 | Metric | Target |
 |--------|--------|
-| Player selection time | <30 seconds for 5 players |
+| Player selection | <30 sec for 5 players |
 | Tracking accuracy | >95% (SAM2 baseline) |
 | Stats accuracy | ±5% vs manual measurement |
 | Processing time | <2x video duration |
-| User satisfaction | "This is exactly what I needed" |
+| Substitution detection | >90% recall |
+| Court mapping success | >80% of frames |
+| PDF generation | <5 seconds |
 
 ---
 
-## What We're NOT Building
+## Risk Mitigation
 
-- Automatic player detection (that's the whole point)
-- Jersey OCR (user provides this)
-- Team classification (user assigns team)
-- Play-by-play detection (future, needs ball)
-- Referee/coach filtering (only track what user clicks)
+| Risk | Mitigation |
+|------|------------|
+| Court mapping fails frequently | Relative stats fallback, manual corner marking (v2) |
+| SAM2 tracking drifts over long videos | Re-anchor capability, shorter segments |
+| Substitution detection false positives | User confirmation required, multiple options |
+| User finds selection tedious | Detection-assisted selection reduces clicks |
+| Stats seem inaccurate | Validate against manual stopwatch, show confidence |
 
 ---
 
 ## Next Steps
 
-1. Review and approve this plan
-2. Start with Phase 1A: Click-to-select UI
-3. Iterate based on testing
+1. **Approve this plan**
+2. **Cherry-pick reusable code** from `feature/progress-tracking-gpu`:
+   - `utils/progress.py`
+   - `utils/frame_selector.py`
+   - Parts of `pipeline.py` (bidirectional tracking)
+3. **Start Phase 1A**: Detection-assisted selection UI
+4. **Iterate** based on testing
 
 Ready to begin implementation?
